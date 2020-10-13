@@ -1,0 +1,486 @@
+#include <reg51.h>
+#include "stdio.h"			//for putchar()
+#define ROW_COL P0			//define ports for easier reading
+#define DAC P2 					//DAC port is P2
+#define maxIndexSeq 10 	// char buffer max size is 10
+
+//led 0
+sbit led = P3^7;
+//DAC wr 
+sbit DacWr = P0^7;
+
+//lcd***4-bit****
+sbit DB7 = P1^7;
+sbit DB6 = P1^6;
+sbit DB5 = P1^5;
+sbit DB4 = P1^4;
+sbit RS = P1^3;
+sbit E = P1^2;
+
+void returnHome(void);
+void entryModeSet(bit id, bit s);
+void displayOnOffControl(bit display, bit cursor, bit blinking);
+void functionSet(void);
+void setDdRamAddress(char address);
+
+void sendChar(char c);
+void sendString(char* str);
+bit getBit(char c, char bitNumber);
+void delay(void);
+
+//DAC lookup table for sin wave simple rate is 128, sampling a sine period which has 255 amp and DC = 128
+code unsigned char lookup[] = {128,134,140,146,152,158,165,170,
+176,182,188,193,198,203,208,213,
+218,222,226,230,234,237,240,243,
+245,248,250,251,253,254,254,255,
+255,255,254,254,253,251,250,248,
+245,243,240,237,234,230,226,222,
+218,213,208,203,198,193,188,182,
+176,170,165,158,152,146,140,134,
+128,121,115,109,103,97,90,85,
+79,73,67,62,57,52,47,42,
+37,33,29,25,21,18,15,12,
+10,7,5,4,2,1,1,0,
+0,0,1,1,2,4,5,7,
+10,12,15,18,21,25,29,33,
+37,42,47,52,57,62,67,73,
+79,85,90,97,103,109,115,121};
+
+//the keypad matrix 
+code unsigned char keypad[4][3] = {{'1','2','3'},
+																	{'4','5','6'},
+																	{'7','8','9'},
+																	{'*','0','#'}};
+
+//method prot. and variables
+//void MSDelay(unsigned int); //delay fuction
+void setup(void);						//setup hw
+void realMain(void);				//the function for RR
+void checkInput(char);			//check the input from Serial and Keypad ('*','#' and 
+														//0-9 numbers are valid but * and # is invalid if there is no available input comes before them) 
+void getKey(void);					//find the row and column number when the key pressed------ External interruptt1
+void serial0(void);					//serial interrupt1
+void timer0(void);					//timer 0 interruptt
+void setAmp(void);					//the input buffer (str[]) coppied to amp_char[] when cont_amp is 1  the char sequence convertes to integer to amp
+void setFreq(void);					//the input buffer (str[]) coppied to freq_char[] when cont_freq is 1 the char sequence convertes to integer to freq
+unsigned char str[maxIndexSeq] = {0};		//key and serial input buffer used in real main and disabled Isr to avoid shareddat problem
+unsigned char index = 0;								//the index of str used in real main and disabled Isr to avoid shareddat problem
+unsigned char cont_freq = 0;						//check int for if available input entered for freq
+unsigned char cont_amp = 0;							//check int for if available input entered for amp
+unsigned int amp = 0;
+unsigned char amp_char[4] = {0};
+unsigned int freq = 0;
+unsigned char freq_char[4] = {0};
+unsigned char error = 0;								//if any invalid sequence entered it becomes 1 and prints '-' (NACK)
+unsigned char timer_count = 0;					//that counts from 0 to 3 then reset. The 4 times timer0 interrupt time is approximately 1ms 
+unsigned char lookUp_index = 0;					//index for lookup table 
+float increment = 0;										//float form of lookup table so that it can be used to get float number increments.
+float increment_len = 0;								//updated in realmain and used in timer0 interruptt
+float amp_ratio = 0;										//updated in realmain and used in timer0 interruptt
+/* 	
+		Yusuf Ünlü
+		Samet Özcan
+*/
+//main function, the while statement is for keypad
+void main()
+{
+	setup();
+	while(1)
+	{
+		realMain(); 						// the actual codee for main function
+	}
+}
+
+void realMain()								//(old information about this func. : the function for RR the main() funtions is used for keypad endless while loops
+{															//there are 2 stage in these while loops one is waits until key released another is waits for key press
+															//Therefore, to run the RR main realMain() is created to used in these loops without rewreating the same codes.)
+	
+	unsigned char cont_lcd = 0;						//check int for if available input entered for freq or amp the lcd start to write new values
+																				//prints '+' (ACK)
+	unsigned char i = 0;									//value for loops in the main
+	
+	//codee here ************************************
+	if(cont_amp == 1) // amplitude is updated 
+	{
+		//EX1 = 0;// dont   //or EA = 0;					//disable interrupts to save shared data in str[] and index	
+		//ES = 0;// dont
+		EA = 0;
+		amp_char[0] = index; //putting the lenght of the input to used in the lcd update and char to integer convertion 
+		for(i =0; i<index; i++)
+			amp_char[i+1] = (str[i]);//getting the data from input buffer
+		index = 0;					//reset str buffer index
+		EA = 1;
+		//EX1 = 1;// dont		// EA = 1;		
+		//ES = 1;// dont
+		setAmp();								//setting amp, char to integer
+		cont_amp = 0;						//reset trigger
+		cont_lcd = 1;						//trigger for lcd update after changing the amp value
+		amp_ratio = ((float)amp/999.0);//done here because the computation wastes time in ISR.
+	}
+	if(cont_freq == 1) // frequency is updated
+	{
+		//EX1 = 0;// dont   //or EA = 0;					//disable interrupts to save shared data in str[] and index	
+		//ES = 0;// dont
+		EA = 0;
+		freq_char[0] = index; //putting the lenght of the input to used in the lcd update and char to integer convertion
+		for(i =0; i<index; i++)
+			freq_char[i+1] = (str[i]);//getting the data from input buffer
+		index = 0;					//reset str buffer index
+		EA = 1;
+		//EX1 = 1;// dont		// EA = 1;											
+		//ES = 1;// dont
+		setFreq();					//setting freq, char to integer
+		cont_freq = 0;			//reset trigger
+		cont_lcd = 1;				//trigger for lcd update after changing the freq value
+		//******************************************????????????????????????????????????????????????????????????
+		increment_len = ((float)128)*((float)freq/450.0); //done here because the computation wastes time in ISR. //normally 1000.0
+																											//the division is done to make the sampling more accurate 
+																											//because the timer is not really interrupt in 1ms
+		//******************************************????????????????????????????????????????????????????????????
+	}
+	if(error == 1) // error
+	{
+		putchar('-');	//NACK
+		error = 0;		//reset trigger
+	}
+	if(cont_lcd == 1) // lcd print
+	{
+		setDdRamAddress(0x07); 				// set address to start of second line
+		for(i=1; i<=amp_char[0]; i++)
+			sendChar(amp_char[i]);
+		for(i=amp_char[0]; i<3; i++)	//clear old displayed chars in these area
+			sendChar(' ');							
+		setDdRamAddress(0x47);				// set address to start of second line
+		for(i=1; i<=freq_char[0]; i++)
+			sendChar(freq_char[i]);
+		for(i=freq_char[0]; i<3; i++)	//clear old displayed chars in these area
+			sendChar(' ');
+		cont_lcd = 0;									//reset trigger
+		putchar('+');									//ACK
+	}
+	//***********************************************
+}
+
+void setup()
+{
+	PCON |= 128;	//uart interruptt divided by 16 instead of 32 to get 19200 boud rate
+	TMOD = 0x22;	//timer 1 and 0, mode 2
+	TH1 = -3;    	//19200 baud rate
+	TH0 = -230;		//-230 for 250/1.086 for xtal 11.0592 MHz, every 250us timer0 interrupted
+	SCON = 0x50; 	//8-bt, 1 stop bitt
+	TR1 = 1;		 	//start timer 1
+	TR0 = 1;			//timer0 start
+	EA = 1;				//glabal interruptt enabled
+	ES = 1;				//serial interruptt enabled
+	ET0 = 1;			//timer0 interruptt enabled
+	IT1 = 1;			//set external interruptt edge sensetive (1 falling edge)(0 rising edge)
+	EX1 = 1;			//external interruptt 1 activated
+	IE1 = 1;			//external interruptt 1 edge flag (clear in interruptt)
+	//PS = 1;				//set serial input as highest priority
+	//led = 0;			//set led0 0
+	//keyboard routine. This sends the ASCII coode for pressed key to the serial port
+	ROW_COL |= 0x70;	//make P0.4-P0.6 an input line these are colums
+	DacWr = 0;				//DAC wr enabled
+	index = 0;
+	//lcd power on and set the 4-bit mode
+	functionSet();
+	entryModeSet(1, 0); 					// increment and no shift
+	displayOnOffControl(1, 1, 1); // display on, cursor on and blinking on
+	returnHome();									//set crusor first address
+	sendString("Amp : ");
+	setDdRamAddress(0x40); // set address to start of second line
+	sendString("Freq : ");
+	setDdRamAddress(0x07); // set address to start of amp
+}
+
+
+void timer0 (void) interrupt 1{	//the time is not realy 1ms becase the througput of the interrupt is not 1 ms because of time spends computations
+	TF0 = 0;               								// Clear flag
+	if(timer_count < 3) 									// 4*250us = 1ms // not really 
+	{
+		timer_count++;
+		//led = 1;
+	}
+	else
+	{
+		//led = 0;														//to calculate the computation time in simulation
+		DacWr = 0; 													//enable to write DAC
+		increment += increment_len;					//the sampling in 1ms,  
+																				//1000/(f*128) increment period in ms 
+																				// => (f*128)/1000 is the number increment in 1 ms
+																				//where 128 is the length of the lookUp table 
+		if(increment>=128.0)
+			increment -= 128.0;
+		lookUp_index = (char)increment;
+		DAC = ((float)lookup[lookUp_index])*amp_ratio;	//converting 0-999 to 0-255 scale   
+		timer_count=0;											//resting the timer count from 3 to 0
+		//led = 1;														//to calculate the computation time in simulation
+	}
+}
+
+void serial0 (void) interrupt 4{ //serial interruptt
+	if(RI==1)									//input from serial
+	{
+		while (RI==0);					//waits for receive unnecessary because the RI = 1 in this case
+		str[index] = SBUF;			//insertng the serial input to str 
+//		SBUF = str[index];			//echoing
+//		while (TI==0);
+//		TI = 0;
+		checkInput(str[index]);	//checking the input whether valid or not
+		RI = 0;									//reset flag
+	}
+	else if(TI == 1)
+	{
+		while (TI==0);					// Wait until stop bit transmit unnecassary because TI =1 in this case
+		TI = 0;									//reset flag
+	}
+}
+
+void getKey(void) interrupt 2 //detect keypad columns and rows when any key pressed //falling edge
+{
+	unsigned char colloc, rowloc;						//colmn and row lock used in getKey()
+	while(1)
+	{
+		//row detection
+		ROW_COL |= 0x0F;
+		ROW_COL &= 0xFE;				//making row 3 is zero
+		colloc = ROW_COL;				//read columns
+		colloc &= 0x70;					//mask unused bits
+		if(colloc != 0x70) 			// column detected
+		{
+			rowloc = 3;      			//save row location
+			break;								//exit while loop
+		}
+		ROW_COL |= 0x0F;
+		ROW_COL &= 0xFD;				//making row 2 is zero
+		colloc = ROW_COL;				//read columns
+		colloc &= 0x70;					//mask unused bits
+		if(colloc != 0x70) 			// column detected
+		{
+			rowloc = 2;      			//save row location
+			break;								//exit while loop
+		}
+		ROW_COL |= 0x0F;
+		ROW_COL &= 0xFB;				//making row 1 is zero
+		colloc = ROW_COL;				//read columns
+		colloc &= 0x70;					//mask unused bits
+		if(colloc != 0x70) 			//column detected
+		{
+			rowloc = 1;      			//save row location
+			break;								//exit while loop
+		}
+		ROW_COL |= 0x0F;
+		ROW_COL &= 0xF7;				//making row 0 is zero
+		colloc = ROW_COL;				//read columns
+		colloc &= 0x70;					//mask unused bits
+		rowloc = 0;      				//save row location
+		break;									//exit while loop
+	}
+	//check column
+	if(colloc == 0x60)
+		str[index] = keypad[rowloc][2];
+	else if(colloc == 0x50)
+		str[index] = keypad[rowloc][1];
+	else
+		str[index] = keypad[rowloc][0];
+	//check the input
+	checkInput(str[index]);
+	ROW_COL &= 0xf0;
+	//putchar('U');
+	IE1 = 0; //set the external interruptt 1 flag to 0
+}
+
+void checkInput(char ch) //used in 2 different loops but in 8051 the ISR is not run at the same time and sharing data problem is not occured in this case
+{
+	if(index > 3)											//outof range of 0-999
+	{
+		error = 1;
+		index = 0;
+	}
+	else if ((int)ch<48 || (int)ch>57)//if input is not a number
+	{
+		if(index>0)											//avoid 0 input case
+		{
+			switch (ch)
+			{
+				case '*':				// check freq
+					cont_freq = 1;
+					break;
+				case '#':				// check amp
+					cont_amp = 1;
+					break;
+				default:				// input is not '*', '#' or (0-9) error 
+					error = 1;
+					index=0;
+			}
+		}else								// 0 input case error or input is not '*', '#' or (0-9) error
+		{
+			error = 1;
+			index=0;
+		}
+	}
+	else
+		index++;
+}
+
+void setAmp()		//converting the amp_char buffer to integer
+{
+	switch (amp_char[0])
+	{
+		case 3:
+			amp = ((int)amp_char[1]-48)*100+((int)amp_char[2]-48)*10+((int)amp_char[3]-48);
+			break;
+		case 2:	
+			amp = ((int)amp_char[1]-48)*10+((int)amp_char[2]-48);
+			break;
+		case 1:
+			amp = ((int)amp_char[1]-48);
+			break;
+		default: 
+			amp = 0;
+	}
+}
+
+
+void setFreq()	//converting the freq_char buffer to integer
+{
+	switch (freq_char[0])
+	{
+		case 3:
+			freq = ((int)freq_char[1]-48)*100+((int)freq_char[2]-48)*10+((int)freq_char[3]-48);
+			break;
+		case 2:	
+			freq = ((int)freq_char[1]-48)*10+((int)freq_char[2]-48);
+			break;
+		case 1:
+			freq = ((int)freq_char[1]-48);
+			break;
+		default: 
+			freq = 0;
+	}
+}
+
+char putchar(unsigned char c)
+{
+	SBUF = c; 				//value[i];	// Load char in SBUF register
+	while (TI==0);		// Wait until stop bit transmit
+	TI = 0;						// Clear TI flag
+	return c;
+}
+
+// LCD Module instructions -------------------------------------------
+void returnHome(void) {
+	RS = 0;						// set the lcd for the use the data for command
+	DB7 = 0;
+	DB6 = 0;
+	DB5 = 0;
+	DB4 = 0;
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	DB5 = 1;
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	delay();
+}
+
+void entryModeSet(bit id, bit s) {
+	RS = 0;						// set the lcd for the use the data for command
+	DB7 = 0;
+	DB6 = 0;
+	DB5 = 0;
+	DB4 = 0;
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	DB6 = 1;					
+	DB5 = id;					//1 inc cursor to the right when writing
+	DB4 = s;					//1 shift the screen
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	delay();
+}
+
+void displayOnOffControl(bit display, bit cursor, bit blinking) {
+	DB7 = 0;
+	DB6 = 0;
+	DB5 = 0;
+	DB4 = 0;
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	DB7 = 1;
+	DB6 = display;		//1 display on
+	DB5 = cursor;			//1 cursor on
+	DB4 = blinking;		//1 blinky on
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	delay();
+}
+
+void functionSet(void) {
+	// The high nibble for the function set is actually sent twice. Why? See 4-bit operation
+	// on pages 39 and 42 of HD44780.pdf.
+	DB7 = 0;
+	DB6 = 0;
+	DB5 = 1;					//Rs=0 r/w=0 db7 =0 db6 =0 db5 =1 db4 = 0
+	DB4 = 0;					//power on
+	RS = 0;						// set the lcd for the use the data for command
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	delay();
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	DB7 = 1;					
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	delay();
+}
+
+void setDdRamAddress(char address) { // set crusor on lcd
+	RS = 0;						// set the lcd for the use the data for command
+	DB7 = 1;
+	DB6 = getBit(address, 6);
+	DB5 = getBit(address, 5);
+	DB4 = getBit(address, 4);
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	DB7 = getBit(address, 3);
+	DB6 = getBit(address, 2);
+	DB5 = getBit(address, 1);
+	DB4 = getBit(address, 0);
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	delay();
+}
+
+void sendChar(char c) {
+	DB7 = getBit(c, 7);		//send first most significant bits
+	DB6 = getBit(c, 6);
+	DB5 = getBit(c, 5);
+	DB4 = getBit(c, 4);
+	RS = 1;						// set the lcd for the use the data for data
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	DB7 = getBit(c, 3);
+	DB6 = getBit(c, 2);
+	DB5 = getBit(c, 1);
+	DB4 = getBit(c, 0);
+	E = 1;						// trigger the lcd to 
+	E = 0;						// get port values
+	delay();
+}
+
+void sendString(char* str) {
+	int index = 0;
+	while (str[index] != 0) {
+		sendChar(str[index]);
+		index++;
+	}
+}
+
+bit getBit(char c, char bitNumber) { //reading the char bit by bit
+	return (c >> bitNumber) & 1;
+}
+
+void delay(void) {			//waits for the process time of the lcd
+	char c;
+	for (c = 0; c < 50; c++);
+}
